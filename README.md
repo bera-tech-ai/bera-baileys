@@ -12,8 +12,12 @@
 - [Sending messages](#sending-messages)
 - [Interactive buttons & lists](#interactive-buttons--lists)
 - [Handling incoming events](#handling-incoming-events)
+- [Group management](#group-management)
+- [Auth state persistence](#auth-state-persistence)
 - [Full example](#full-example)
 - [API reference](#api-reference)
+  - [Top-level exports](#top-level-exports)
+  - [Module map](#module-map)
 - [Caveats](#caveats)
 - [Credits](#credits)
 - [License](#license)
@@ -24,10 +28,10 @@
 - Send and receive text, image, video, audio, document, and sticker messages
 - Send interactive **button** and **list** messages (quick replies, URL buttons, call buttons, copy-code buttons, and list menus)
 - Group management (create, add/remove participants, promote/demote, settings)
+- Community and newsletter (channel) support
 - Read receipts, presence updates, typing indicators
 - Multi-device support with in-memory or file-based auth state persistence
 - Polls, reactions, ephemeral/disappearing messages, message edits & deletes
-- Newsletter (channel) support
 - Written entirely in TypeScript with full type definitions
 
 ## Install
@@ -50,9 +54,11 @@ pnpm add bera-baileys
 npm install jimp link-preview-js sharp audio-decode
 ```
 
-- `jimp` / `sharp` — required if you want auto-generated image thumbnails
-- `link-preview-js` — required if you want auto-generated link previews
-- `audio-decode` — required for voice-note waveform generation
+| Package | Needed for |
+|---|---|
+| `jimp` / `sharp` | Auto-generated image thumbnails |
+| `link-preview-js` | Auto-generated link previews |
+| `audio-decode` | Voice-note waveform generation |
 
 ## Quick start
 
@@ -116,6 +122,17 @@ if (!sock.authState.creds.registered) {
 }
 ```
 
+### Picking a WhatsApp Web version
+
+```ts
+import makeWASocket, { fetchLatestBeraBaileysVersion, useMultiFileAuthState } from 'bera-baileys'
+
+const { state } = await useMultiFileAuthState('auth_info_baileys')
+const { version, isLatest } = await fetchLatestBeraBaileysVersion()
+
+const sock = makeWASocket({ version, auth: state })
+```
+
 ## Sending messages
 
 ```ts
@@ -144,6 +161,14 @@ await sock.sendMessage(jid, {
 	fileName: 'report.pdf'
 })
 
+// sticker
+await sock.sendMessage(jid, { sticker: { url: './sticker.webp' } })
+
+// poll
+await sock.sendMessage(jid, {
+	poll: { name: 'Pick a lunch spot', values: ['Tacos', 'Pizza', 'Sushi'], selectableCount: 1 }
+})
+
 // mention someone in a group
 await sock.sendMessage(groupJid, {
 	text: '@1234567890 check this out',
@@ -152,6 +177,9 @@ await sock.sendMessage(groupJid, {
 
 // react to a message
 await sock.sendMessage(jid, { react: { text: '🔥', key: someMessage.key } })
+
+// edit a message you sent
+await sock.sendMessage(jid, { text: 'edited text', edit: someMessage.key })
 
 // delete a message you sent
 await sock.sendMessage(jid, { delete: someMessage.key })
@@ -201,6 +229,17 @@ await sendButtonMessage(sock, jid, {
 })
 ```
 
+Only building the message (without sending) is also available, e.g. to forward or queue it:
+
+```ts
+import { generateButtonMessage } from 'bera-baileys'
+
+const message = await generateButtonMessage(sock, {
+	text: 'Choose an option',
+	buttons: [{ type: 'reply', displayText: 'Option A', id: 'opt_a' }]
+})
+```
+
 ### List message
 
 ```ts
@@ -228,6 +267,8 @@ await sendListMessage(sock, jid, {
 	]
 })
 ```
+
+`generateListMessage(sock, options)` is the build-only counterpart, mirroring `generateButtonMessage`.
 
 ### Reading a button/list reply
 
@@ -270,6 +311,70 @@ sock.ev.process(async (events) => {
 	if (events['presence.update']) {
 		console.log('presence update', events['presence.update'])
 	}
+
+	if (events['group-participants.update']) {
+		console.log('group membership changed', events['group-participants.update'])
+	}
+})
+```
+
+Full list of events you can listen for (via `sock.ev.on(name, handler)` or inside `sock.ev.process`): `connection.update`, `creds.update`, `messaging-history.set`, `chats.upsert`, `chats.update`, `chats.delete`, `presence.update`, `contacts.upsert`, `contacts.update`, `messages.upsert`, `messages.update`, `messages.delete`, `messages.reaction`, `message-receipt.update`, `groups.upsert`, `groups.update`, `group-participants.update`, `group.member-tag.update`, `blocklist.set`, `blocklist.update`, `call`, `labels.association`, `labels.edit`.
+
+## Group management
+
+```ts
+// create a group
+const group = await sock.groupCreate('Weekend Trip', ['1234567890@s.whatsapp.net'])
+
+// add / remove / promote / demote participants
+await sock.groupParticipantsUpdate(group.id, ['1234567890@s.whatsapp.net'], 'add')
+await sock.groupParticipantsUpdate(group.id, ['1234567890@s.whatsapp.net'], 'remove')
+await sock.groupParticipantsUpdate(group.id, ['1234567890@s.whatsapp.net'], 'promote')
+await sock.groupParticipantsUpdate(group.id, ['1234567890@s.whatsapp.net'], 'demote')
+
+// rename / re-describe
+await sock.groupUpdateSubject(group.id, 'New group name')
+await sock.groupUpdateDescription(group.id, 'Trip planning happens here')
+
+// settings
+await sock.groupSettingUpdate(group.id, 'announcement') // only admins can send messages
+await sock.groupToggleEphemeral(group.id, 7 * 24 * 60 * 60) // 7-day disappearing messages
+
+// invite links
+const code = await sock.groupInviteCode(group.id)
+console.log(`https://chat.whatsapp.com/${code}`)
+await sock.groupRevokeInvite(group.id)
+
+// leave a group
+await sock.groupLeave(group.id)
+
+// fetch metadata / all groups you're in
+const metadata = await sock.groupMetadata(group.id)
+const allGroups = await sock.groupFetchAllParticipating()
+```
+
+## Auth state persistence
+
+`useMultiFileAuthState(folder)` is the simplest option — it writes creds/keys to a local folder so a restart doesn't require re-scanning the QR code:
+
+```ts
+import { useMultiFileAuthState } from 'bera-baileys'
+
+const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
+const sock = makeWASocket({ auth: state })
+sock.ev.on('creds.update', saveCreds)
+```
+
+For production deployments you typically want to persist to a database instead of the filesystem — implement the `AuthenticationState` (`creds` + `keys` with `get`/`set`) shape yourself and pass it as `auth`. `makeCacheableSignalKeyStore(keys, logger)` wraps any key store with an in-memory cache, which noticeably speeds up encrypt/decrypt on busy chats:
+
+```ts
+import { makeCacheableSignalKeyStore } from 'bera-baileys'
+
+const sock = makeWASocket({
+	auth: {
+		creds: state.creds,
+		keys: makeCacheableSignalKeyStore(state.keys, logger)
+	}
 })
 ```
 
@@ -293,15 +398,74 @@ The full generated API reference (types, socket methods, events) can be built lo
 npm run build:docs
 ```
 
-Key entry points:
+### Top-level exports
+
+Everything below is importable directly from `'bera-baileys'`:
+
+```ts
+import makeWASocket, {
+	// connection / auth
+	useMultiFileAuthState,
+	makeCacheableSignalKeyStore,
+	fetchLatestBeraBaileysVersion,
+	DisconnectReason,
+	DEFAULT_CONNECTION_CONFIG,
+
+	// message utilities
+	generateMessageIDV2,
+	getAggregateVotesInPollMessage,
+	prepareWAMessageMedia,
+	downloadMediaMessage,
+	extractMessageContent,
+
+	// interactive buttons & lists
+	sendButtonMessage,
+	generateButtonMessage,
+	sendListMessage,
+	generateListMessage,
+
+	// jid helpers
+	isJidBroadcast,
+	isJidGroup,
+	isJidNewsletter,
+	isJidUser,
+	jidNormalizedUser,
+
+	// protobuf + types
+	proto,
+	WAMessage,
+	WAMessageKey,
+	WAMessageContent,
+	CacheStore
+} from 'bera-baileys'
+```
+
+`makeWASocket(config)` is the default export and the main entry point — it returns the `WASocket` instance used for everything else in this document (`sock.sendMessage`, `sock.ev`, `sock.groupCreate`, ...).
+
+### Module map
+
+The package re-exports everything from these internal modules (see `src/index.ts`), so you rarely need to reach into subpaths:
+
+| Module | Contains |
+|---|---|
+| `WAProto` | Generated protobuf types for the WhatsApp wire protocol (`proto.Message`, `proto.WebMessageInfo`, ...) |
+| `Utils` | `useMultiFileAuthState`, `makeCacheableSignalKeyStore`, message building/media download helpers, crypto, JID helpers, link previews, history sync, event buffering |
+| `Types` | `AuthenticationState`, `SocketConfig`, `WAMessage`, `GroupMetadata`, `Contact`, `Chat`, events map, `DisconnectReason`, and every other public type |
+| `Defaults` | `DEFAULT_CONNECTION_CONFIG` and other default values/constants |
+| `WABinary` | Low-level binary-node (WhatsApp's XML-like wire format) encode/decode helpers |
+| `WAM` | WhatsApp analytics/metrics protobuf helpers |
+| `WAUSync` | User-sync protocol helpers (querying contacts' status, business profile, etc.) |
+| `Buttons` | `sendButtonMessage`, `sendListMessage`, `generateButtonMessage`, `generateListMessage`, and their supporting types |
+| `Socket` (internal, layered) | `makeWASocket` itself, composed from `groups.ts`, `chats.ts`, `messages-send.ts`, `messages-recv.ts`, `business.ts`, `newsletter.ts`, `communities.ts` — these attach `sock.groupCreate`, `sock.sendMessage`, `sock.chatModify`, etc. onto the socket returned by `makeWASocket` |
+
+Key entry points at a glance:
 
 - `makeWASocket(config)` — creates and returns the socket instance
 - `useMultiFileAuthState(folder)` — file-based credential/session store
 - `sock.sendMessage(jid, content, options?)` — send any regular message type
-- `sock.sendButtonMessage(jid, options)` / `sendButtonMessage(sock, jid, options)` — send interactive buttons
-- `sock.sendListMessage` / `sendListMessage(sock, jid, options)` — send an interactive list
+- `sendButtonMessage(sock, jid, options)` / `sendListMessage(sock, jid, options)` — send interactive buttons/lists
 - `sock.ev` — the event emitter for all connection/message/chat events
-- `sock.groupCreate`, `sock.groupAdd`, `sock.groupUpdateSubject`, etc. — group management
+- `sock.groupCreate`, `sock.groupParticipantsUpdate`, `sock.groupUpdateSubject`, etc. — group management (see [Group management](#group-management))
 - `fetchLatestBeraBaileysVersion()` — fetches the latest WhatsApp Web version to connect with
 
 ## Caveats
